@@ -22,29 +22,20 @@ import { getContext } from '@/st/context';
 export const PREFS_KEY = 'ST-BaiImage-CCExtra';
 
 export interface Prefs {
+  /** 插件划线触发总开关。关闭后划词与点选区均不响应，无需刷新酒馆。 */
+  enabled: boolean;
   /** 划线写完 tag 后是否自动点卡片的「生成图片」。关掉 = 手动模式（只写 tag）。 */
   autoGenerate: boolean;
-  /**
-   * 是否先出候选、等确认再写回（= 确认式）。
-   *
-   * 与 `autoGenerate` **不是正交的两条轴**，而是有上下级：自动出图开着时这一项被强制为关。
-   * 理由不是「会打架」，而是**语义重复** —— 「自动出图」已经是「划线 → 写 tag → 出图」
-   * 一条完整闭环，中间再插一步确认没有意义，两个勾同时亮着还会自相矛盾。
-   */
+  /** 是否先出候选、等确认再写回（= 确认式）。 */
   confirmTag: boolean;
-  /**
-   * 是否让副 API 顺手交一份 Base tag 的中文对照（只给人看，绝不参与出图）。
-   *
-   * 这是全项目**第二处**与柏宝绘的 messages 偏离（第一处是 source=切片）：
-   * 它会在 taskBlock 里多一句输出要求。默认开，关掉即回到「只差 source」的最保守口径，
-   * 排错时这是第一条退路。记账见 docs/ENGINEERING.md §1 的例外清单。
-   */
+  /** 是否让副 API 顺手交一份 Base tag 的中文对照（只给人看，绝不参与出图）。 */
   tagZhPreview: boolean;
   /** 是否显示 🍃 悬浮球。 */
   showOrb: boolean;
 }
 
 export const DEFAULT_PREFS: Readonly<Prefs> = Object.freeze({
+  enabled: true,
   autoGenerate: true,
   confirmTag: false,
   tagZhPreview: true,
@@ -54,16 +45,6 @@ export const DEFAULT_PREFS: Readonly<Prefs> = Object.freeze({
 type PrefsListener = (prefs: Prefs) => void;
 
 const listeners = new Set<PrefsListener>();
-
-/**
- * 本会话内「改过之后」的真相。
- *
- * 为什么需要它：`getContext()` 在加载顺序、切聊天、宿主异常时都可能返回 null。
- * 若每次都硬读宿主，一次读不到就会把开关**回弹成默认**——用户刚关掉自动出图，
- * 下一张图又被自动点了，这是最难复现也最难解释的 bug。
- *
- * 只在写入后置位，所以没改过的用户仍然是「每次现读」：手改 settings.json 立刻生效。
- */
 let memory: Prefs | null = null;
 
 function asBoolean(value: unknown, fallback: boolean): boolean {
@@ -74,17 +55,13 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/**
- * 把任意输入规整成合法 Prefs。
- * 抽成纯函数是为了能直接单测「存了 null / 数组 / 字符串 / 少字段」这些真实会发生的脏数据。
- */
 export function normalizePrefs(raw: unknown): Prefs {
   const source = isPlainObject(raw) ? raw : {};
-  // 顺序很重要：先算 autoGenerate，再用它压 confirmTag。反过来会漏掉「自动出图开着、
-  // 需确认也开着」这种非法组合（手改 settings.json、旧版本写下的值都可能造出来）。
+  const enabled = asBoolean(source.enabled, DEFAULT_PREFS.enabled);
   const autoGenerate = asBoolean(source.autoGenerate, DEFAULT_PREFS.autoGenerate);
   const confirmTag = autoGenerate ? false : asBoolean(source.confirmTag, DEFAULT_PREFS.confirmTag);
   return {
+    enabled,
     autoGenerate,
     confirmTag,
     tagZhPreview: asBoolean(source.tagZhPreview, DEFAULT_PREFS.tagZhPreview),
@@ -92,14 +69,12 @@ export function normalizePrefs(raw: unknown): Prefs {
   };
 }
 
-/** 现读宿主。宿主不可用返回 null（与「宿主里没有这个键」区分开：后者等于默认值）。 */
 function readStored(): Prefs | null {
   const settings = getContext()?.extensionSettings;
   if (!settings) return null;
   return normalizePrefs(settings[PREFS_KEY]);
 }
 
-/** 读偏好。本会话改过就以内存为准，否则每次现读宿主。 */
 export function readPrefs(): Prefs {
   if (memory) return memory;
   return readStored() ?? { ...DEFAULT_PREFS };
@@ -115,16 +90,6 @@ function broadcast(next: Prefs): void {
   }
 }
 
-/**
- * 合并写入并落盘。
- *
- * 三个刻意的细节：
- * 1. **保留未知字段**：写入时以原对象为底再覆盖已知两项。以后（或别的插件好心往这个键里
- *    塞东西）都不会被我们抹掉。
- * 2. **宿主缺失不报错**：getContext 还没就绪时只更新内存并广播，不回写。宁可这一次没记住，
- *    也不能因为写设置把主流程打断。
- * 3. **先置内存再写盘**：写盘可能被 debounce 或失败，但用户按下开关的那一刻就该生效。
- */
 export function updatePrefs(patch: Partial<Prefs>): Prefs {
   const context = getContext();
   const settings = context?.extensionSettings;
@@ -132,7 +97,6 @@ export function updatePrefs(patch: Partial<Prefs>): Prefs {
   const base = isPlainObject(stored) ? { ...stored } : {};
   const next = normalizePrefs({ ...base, ...patch });
 
-  // 本会话的真相立刻更新，之后即使宿主读不到也不会回弹
   memory = next;
 
   if (settings) {
@@ -140,7 +104,7 @@ export function updatePrefs(patch: Partial<Prefs>): Prefs {
     try {
       context?.saveSettingsDebounced?.();
     } catch {
-      /* 保存失败只影响「下次还记不记得」，不该让开关本身看起来没按下 */
+      /* ignore */
     }
   }
 
@@ -148,7 +112,6 @@ export function updatePrefs(patch: Partial<Prefs>): Prefs {
   return next;
 }
 
-/** 订阅偏好变更。返回取消订阅函数。 */
 export function onPrefsChange(listener: PrefsListener): () => void {
   listeners.add(listener);
   return () => {
@@ -156,7 +119,6 @@ export function onPrefsChange(listener: PrefsListener): () => void {
   };
 }
 
-/** 恢复默认（调试口用，也方便以后加「恢复默认」按钮）。 */
 export function resetPrefs(): Prefs {
   const context = getContext();
   const settings = context?.extensionSettings;
@@ -168,7 +130,7 @@ export function resetPrefs(): Prefs {
     try {
       context?.saveSettingsDebounced?.();
     } catch {
-      /* 同上 */
+      /* ignore */
     }
   }
 
@@ -176,7 +138,6 @@ export function resetPrefs(): Prefs {
   return next;
 }
 
-/** 仅供测试：清掉内存镜像，模拟「刷新页面后重新从宿主读」。 */
 export function forgetPrefsCache(): void {
   memory = null;
 }
