@@ -42,10 +42,18 @@
  * 气泡压在选区内部偏下避开它。
  */
 
+/**
+ * 划线触发（改版）：
+ * 1. 受面板「启用划线出图」总开关控制，关闭后完全静默；
+ * 2. 划词/长按选区时不主动弹出按钮，避免与其他划词插件重叠；
+ * 3. 轻点一下蓝色选中区域时，在点击位置上方弹出「⚡ 生成 / ＋ 待生成 / ✕」。
+ */
+
 import { captureSelection, describeCapture, type SelectionCapture } from '@/selection/capture';
 import { isAiStoryMessage, getContext } from '@/st/context';
 import { cancelSelectionRun, runSelection } from '@/runner/runSelection';
 import { addDraft, buildSegmentAnchor, countDrafts } from '@/state/candidates';
+import { onPrefsChange, readPrefs } from '@/state/prefs';
 import { diagnostic } from '@/runner/diagnostic';
 import { notify } from '@/ui/notify';
 import { setBusyInfo, openPanel } from '@/ui/panel';
@@ -56,6 +64,28 @@ const DRAFT_TEXT = '＋ 待生成';
 const CLOSE_TEXT = '✕';
 const CANCEL_TEXT = '✕ 取消分析';
 
+const BASE_BG = 'rgba(28,36,44,.94)';
+const DRAFT_BG = 'rgba(56,72,88,.94)';
+const CANCEL_BG = 'rgba(180,42,46,.95)';
+
+/** 判定为「轻点」的最大手指移动距离（px）与最长按压时间（ms）。 */
+const TAP_MAX_MOVE = 14;
+const TAP_MAX_DURATION = 500;
+/** 蓝色选区点击命中容差（px），防止点在行间距或边缘处漏判。 */
+const HIT_PADDING = 10;
+/** 工具条刚弹出时的防误关保护窗口（ms），防止 touchend 后的合成 click 立刻把它关掉。 */
+const OPEN_GUARD_MS = 400;
+/** 触屏事件后忽略浏览器合成 mouse 事件的时间窗口（ms）。 */
+const TOUCH_MOUSE_GUARD_MS = 700;
+
+interface TapCandidate {
+  capture: SelectionCapture;
+  startX: number;
+  startY: number;
+  startTime: number;
+  moved: boolean;
+}
+
 let toolbar: HTMLDivElement | null = null;
 let generateButton: HTMLButtonElement | null = null;
 let draftButton: HTMLButtonElement | null = null;
@@ -63,35 +93,14 @@ let closeButton: HTMLButtonElement | null = null;
 let cancelButton: HTMLButtonElement | null = null;
 
 let pending: SelectionCapture | null = null;
+let tapCandidate: TapCandidate | null = null;
+let openedAt = 0;
+let lastTouchTime = 0;
 let busy = false;
 let cancelling = false;
-/** 正在分析哪一楼。取消按楼层精确掐，不去动别人的在途请求。 */
 let runningFloor: number | null = null;
 let bound = false;
 
-/**
- * 选区稳定判定：手机拖动选区手柄时 selectionchange 会连发，停 120ms 才算划完。
- * v0.2.3 用 350ms 是为了「拖完再出」，实测太钝（真机上像失灵）；
- * 120ms 拖动中每次变化都重置计时，停手即出。
- */
-const SETTLE_DELAY = 120;
-let settleTimer: number | null = null;
-/**
- * 显式忽略：用户点了 ✕ / Esc / 完成一次动作后置位——这次选区不要了，
- * 滚动与 selectionchange 不再复显。选区塌陷或新的手势（mouseup/touchend）解除。
- * 它不是 v0.2.3 那个会死锁的抑制位：那只拦「自动复显」，绝不拦新手势。
- */
-let dismissed = false;
-
-/** 三套颜色：正常 / 待生成（轻一点，不抢主按钮）/ 取消（红，明确会中止任务）。 */
-const BASE_BG = 'rgba(28,36,44,.94)';
-const DRAFT_BG = 'rgba(56,72,88,.94)';
-const CANCEL_BG = 'rgba(180,42,46,.95)';
-
-/**
- * 触屏设备上 12px 小药丸按不中（Apple HIG / Android 都建议 ≥44px 命中区）。
- * 粗指针环境放大按钮，鼠标环境保持原样。
- */
 const COARSE_POINTER =
   typeof window !== 'undefined' && typeof window.matchMedia === 'function'
     ? window.matchMedia('(pointer: coarse)').matches
@@ -115,15 +124,9 @@ function stylePill(button: HTMLButtonElement, background: string): void {
     WebkitTouchCallout: 'none',
     touchAction: 'manipulation',
   } as Partial<CSSStyleDeclaration>);
-  // 按下不许清选区（见文件头第 2 条）。三个按钮都要绑，漏一个就点不动。
   button.addEventListener('mousedown', event => event.preventDefault());
 }
 
-/**
- * click 与 touchend 双绑：触屏直接在 touchend 响应，
- * 不等浏览器合成 click（iOS 上慢且可能被系统菜单截走）；300ms 忙锁防止
- * touchend + 合成 click 双触发跑两遍。
- */
 function bindButtonActivation(button: HTMLButtonElement, onClick: () => void): void {
   let lockUntil = 0;
   const fire = (event: Event): void => {
@@ -158,22 +161,17 @@ function ensureToolbar(): HTMLDivElement {
     display: 'none',
     alignItems: 'center',
     gap: COARSE_POINTER ? '8px' : '4px',
-    // 容器本身不可见也不吃事件：否则它会在选区旁边留一块"透明墙"
     background: 'transparent',
-    // 触屏按按钮时不许触发文字选择 / iOS 长按呼出
     userSelect: 'none',
     WebkitUserSelect: 'none',
     WebkitTouchCallout: 'none',
     touchAction: 'manipulation',
   } as Partial<CSSStyleDeclaration>);
-  // 容器级 pointerdown preventDefault：iOS 上点按钮的瞬间会清掉选区（点在选区外），
-  // 按钮用的是快照不依赖选区，但清选区会连带触发 selectionchange → 收起竞态。
   el.addEventListener('pointerdown', event => event.preventDefault());
 
   generateButton = makeButton(GENERATE_TEXT, BASE_BG, () => void trigger());
   draftButton = makeButton(DRAFT_TEXT, DRAFT_BG, () => parkSelection());
   closeButton = makeButton(CLOSE_TEXT, BASE_BG, () => hide());
-  // 忙态才出现的唯一按钮
   cancelButton = makeButton(CANCEL_TEXT, CANCEL_BG, () => cancel());
   cancelButton.style.display = 'none';
 
@@ -187,42 +185,28 @@ function isToolbarVisible(): boolean {
   return Boolean(toolbar && toolbar.style.display === 'flex');
 }
 
-/**
- * 定位：压在**选区内部、纵向偏下**（62% 处），横向居中。
- *
- * 为什么不是「选区下方」：那一条是所有划线工具的公共地盘——系统选择菜单（拷贝/翻译）、
- * 其他插件的气泡都在那儿，谁挂上去都会互相盖（v0.2.4 的教训）。
- * 选区内偏下没人占，而且离用户刚划完的位置最近，点起来顺手。
- */
-function showAt(rect: DOMRect): void {
+function showAtPoint(x: number, y: number): void {
   const el = ensureToolbar();
-  const width = el.offsetWidth || 150;
-  const height = el.offsetHeight || 26;
-  const centerX = rect.left + rect.width / 2;
-  const anchorY = rect.top + rect.height * 0.62;
-  const left = Math.min(Math.max(8, centerX - width / 2), Math.max(8, window.innerWidth - width - 8));
-  const top = Math.min(Math.max(8, anchorY - height / 2), Math.max(8, window.innerHeight - height - 8));
+  el.style.visibility = 'hidden';
+  el.style.display = 'flex';
+  const width = el.offsetWidth || 180;
+  const height = el.offsetHeight || 36;
+  const left = Math.min(Math.max(8, x - width / 2), Math.max(8, window.innerWidth - width - 8));
+  let top = y - height - 14;
+  if (top < 8) {
+    top = Math.min(y + 14, Math.max(8, window.innerHeight - height - 8));
+  }
   el.style.left = `${Math.round(left)}px`;
   el.style.top = `${Math.round(top)}px`;
-  el.style.display = 'flex';
+  el.style.visibility = 'visible';
 }
 
-/**
- * 收起工具条。`dismiss` 只在**用户明确说「这次选区不要了」**时为 true
- * （✕ / Esc / 一次动作完成）：此后滚动与 selectionchange 不再自动复显。
- * 捕获失败、选区塌陷这类「非用户意图」的收起必须传 false——否则一次失败
- * 就把复显路堵死，这就是 v0.2.5 抑制位死锁的变体（真机录屏 32 秒不出气泡）。
- */
-function hide(dismiss = true): void {
+function hide(): void {
   pending = null;
+  tapCandidate = null;
   if (toolbar) toolbar.style.display = 'none';
-  dismissed = dismiss;
 }
 
-/**
- * 忙态 = 只剩一个取消键。以前这里会 `disabled = true`，结果就是「想取消却没有入口」——
- * 按钮变成一句「分析中…」的死字，用户只能干等或刷新页面。
- */
 function setBusy(value: boolean, floor: number | null = null): void {
   busy = value;
   runningFloor = value ? floor : null;
@@ -233,7 +217,6 @@ function setBusy(value: boolean, floor: number | null = null): void {
   cancelButton.style.display = value ? 'inline-block' : 'none';
 }
 
-/** 掐掉当前这一楼的在途分析。重复点击无副作用（abort 幂等）。 */
 function cancel(): void {
   if (!busy || cancelling || runningFloor === null) return;
   cancelling = true;
@@ -245,17 +228,13 @@ async function trigger(): Promise<void> {
   const capture = pending;
   if (!capture || busy) return;
   setBusy(true, capture.messageId);
-  // 面板里同步显示一行状态：按钮可能被滚走、或者用户正开着面板
   setBusyInfo({ label: `正在分析第 ${capture.messageId} 楼…`, onCancel: cancel });
   diagnostic('trigger:click', { floor: capture.messageId, chars: capture.text.length });
   try {
     const outcome = await runSelection(capture);
-    // runSelection 取消时只返回状态、不弹提示——不补这一句，用户会以为「点了没反应」
     if (outcome.status === 'aborted') notify('info', '已取消，正文未改动');
-    // 确认式：候选已经放进池子，直接把面板打开让人确认（不然用户不知道下一步在哪）
     if (outcome.status === 'pending') void openPanel();
   } catch (error) {
-    // runSelection 自己把异常转成了 toast；这里只兜住「连 toast 都没来得及」的情况
     console.error('[CCX] 划线出图异常', error);
   } finally {
     cancelling = false;
@@ -265,12 +244,6 @@ async function trigger(): Promise<void> {
   }
 }
 
-/**
- * 「＋ 待生成」：只写池子，不发请求。
- *
- * **不打开面板**：这个按钮的语义就是「先攒着」，弹面板等于打断当前阅读。
- * 但 toast 必须说清「没调 API」——否则在自动模式下，用户会以为它已经在跑了。
- */
 function parkSelection(): void {
   const capture = pending;
   if (!capture || busy) return;
@@ -300,110 +273,210 @@ function parkSelection(): void {
   hide();
 }
 
-/** 选区落定后：能出图就浮按钮，不能就安静地什么都不做。失败不留任何死锁状态——下次事件照常重查。 */
-function settle(): void {
-  if (busy) return;
+function isInsideStoryText(target: EventTarget | null): boolean {
+  if (!target || typeof Node === 'undefined') return false;
+  const el = target instanceof Element ? target : target instanceof Node ? target.parentElement : null;
+  if (!el) return false;
+  // 避开其他插件的悬浮按钮、图标、链接和输入控件
+  if (el.closest('button, a, input, textarea, select, [role="button"], svg')) return false;
+  return Boolean(el.closest('.mes_text'));
+}
+
+function isPointInRange(x: number, y: number, range: Range, padding = HIT_PADDING): boolean {
+  const rects = range.getClientRects();
+  if (rects.length > 0) {
+    for (let i = 0; i < rects.length; i += 1) {
+      const r = rects[i];
+      if (r.width === 0 && r.height === 0) continue;
+      if (
+        x >= r.left - padding &&
+        x <= r.right + padding &&
+        y >= r.top - padding &&
+        y <= r.bottom + padding
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+  const box = range.getBoundingClientRect();
+  if (box.width === 0 && box.height === 0) return false;
+  return (
+    x >= box.left - padding &&
+    x <= box.right + padding &&
+    y >= box.top - padding &&
+    y <= box.bottom + padding
+  );
+}
+
+function tryBuildTapCandidate(
+  doc: Document,
+  win: Window,
+  x: number,
+  y: number,
+  target: EventTarget | null,
+): TapCandidate | null {
+  if (!readPrefs().enabled || busy) return null;
+  if (!isInsideStoryText(target)) return null;
+
+  const selection = doc.getSelection?.() ?? win.getSelection();
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return null;
+
+  const range = selection.getRangeAt(0);
+  if (!isPointInRange(x, y, range)) return null;
+
   const outcome = captureSelection();
   if (!outcome.ok) {
-    // 「什么都没选中」是绝大多数鼠标抬起的正常情况（点按钮、点面板），不记日志；
-    // 只有用户确实划了东西、却没通过校验时才值得进诊断流。
     if (outcome.reason !== 'no-selection' && outcome.reason !== 'empty-selection') {
       diagnostic('trigger:no-capture', { reason: outcome.reason, detail: outcome.detail ?? null });
     }
-    hide(false);
-    return;
+    return null;
   }
+
   const context = getContext();
   const message = context?.chat?.[outcome.capture.messageId];
   if (!isAiStoryMessage(message)) {
     diagnostic('trigger:skip', { reason: 'not-ai-story-message', floor: outcome.capture.messageId });
-    hide(false);
-    return;
+    return null;
   }
-  const selection = window.getSelection();
-  if (!selection || selection.rangeCount === 0) {
-    hide(false);
-    return;
-  }
-  const rect = selection.getRangeAt(0).getBoundingClientRect();
-  pending = outcome.capture;
-  dismissed = false;
-  console.debug(describeCapture(outcome.capture));
-  showAt(rect);
-}
 
-/** 选区稳定后落定；手机拖动手柄期间连发的 selectionchange 靠去抖挡住。 */
-function scheduleSettle(): void {
-  if (settleTimer !== null) window.clearTimeout(settleTimer);
-  settleTimer = window.setTimeout(() => {
-    settleTimer = null;
-    settle();
-  }, SETTLE_DELAY);
-}
-
-function onSelectionChange(): void {
-  const selection = typeof document !== 'undefined' ? document.getSelection?.() ?? window.getSelection() : null;
-  if (!selection || selection.isCollapsed) {
-    // 划到一半塌陷（误触 / 重新开始）：停掉在途判定，收起气泡，解除显式忽略
-    if (settleTimer !== null) {
-      window.clearTimeout(settleTimer);
-      settleTimer = null;
-    }
-    if (isToolbarVisible()) hide(false);
-    dismissed = false;
-    return;
-  }
-  // 非空选区：只要不是用户显式忽略的，就照常去查。v0.2.3 的抑制位死锁已删——
-  // 一次捕获失败不该让气泡永久哑火（真机录屏 32 秒不出气泡的根因）。
-  if (dismissed) return;
-  scheduleSettle();
-}
-
-/**
- * 滚动跟随：气泡是 fixed 定位，文字滚走了它不会自己动。
- * 只要气泡正显示且选区还活着，就按当前选区重新锚定；选区塌陷才收起。
- * 显式忽略（✕ / Esc / 动作完成）后不复显、也不跟随。
- */
-function onScroll(): void {
-  if (!isToolbarVisible() || dismissed) return;
-  const selection = typeof document !== 'undefined' ? document.getSelection?.() ?? window.getSelection() : null;
-  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
-    hide(false);
-    return;
-  }
-  showAt(selection.getRangeAt(0).getBoundingClientRect());
+  return {
+    capture: outcome.capture,
+    startX: x,
+    startY: y,
+    startTime: Date.now(),
+    moved: false,
+  };
 }
 
 export interface TriggerOptions {
-  /** 注入 document / window，便于测试与多窗口场景。 */
   doc?: Document;
   win?: Window;
 }
 
-/**
- * 绑定划线触发。可安全重复调用（只会绑一次）。
- * 返回解绑函数，供「插件卸载 / 切聊天清场」使用。
- */
 export function bindSelectionTrigger(options: TriggerOptions = {}): () => void {
   const doc = options.doc ?? document;
   const win = options.win ?? window;
   if (bound) return () => {};
   bound = true;
 
-  // mouseup / touchend 是「用户主动手势」：一律解除显式忽略——用户在划新选区，必须照常浮出。
-  // 桌面 mouseup 立即落定；触屏 touchend 走 120ms 去抖（等选区最终定型）。
-  const onSettle = () => {
-    dismissed = false;
-    settle();
+  const unbindPrefs = onPrefsChange(prefs => {
+    if (!prefs.enabled) {
+      tapCandidate = null;
+      if (!busy) hide();
+    }
+  });
+
+  const onTouchStart = (event: TouchEvent) => {
+    lastTouchTime = Date.now();
+    if (event.touches.length !== 1) {
+      tapCandidate = null;
+      return;
+    }
+    if (toolbar && event.target instanceof Node && toolbar.contains(event.target)) {
+      tapCandidate = null;
+      return;
+    }
+    const touch = event.touches[0];
+    const candidate = tryBuildTapCandidate(doc, win, touch.clientX, touch.clientY, event.target);
+    if (candidate) {
+      tapCandidate = candidate;
+      return;
+    }
+    tapCandidate = null;
+    if (isToolbarVisible() && !busy && Date.now() - openedAt > OPEN_GUARD_MS) {
+      hide();
+    }
   };
-  const onTouchEnd = () => {
-    dismissed = false;
-    scheduleSettle();
+
+  const onTouchMove = (event: TouchEvent) => {
+    if (!tapCandidate || event.touches.length !== 1) {
+      tapCandidate = null;
+      return;
+    }
+    const touch = event.touches[0];
+    const dx = touch.clientX - tapCandidate.startX;
+    const dy = touch.clientY - tapCandidate.startY;
+    if (dx * dx + dy * dy > TAP_MAX_MOVE * TAP_MAX_MOVE) {
+      tapCandidate.moved = true;
+      tapCandidate = null;
+    }
   };
+
+  const onTouchEnd = (event: TouchEvent) => {
+    lastTouchTime = Date.now();
+    const candidate = tapCandidate;
+    tapCandidate = null;
+    if (!candidate || candidate.moved) return;
+    if (!readPrefs().enabled || busy) return;
+    if (Date.now() - candidate.startTime > TAP_MAX_DURATION) return;
+
+    const touch = event.changedTouches[0];
+    const x = touch ? touch.clientX : candidate.startX;
+    const y = touch ? touch.clientY : candidate.startY;
+    const dx = x - candidate.startX;
+    const dy = y - candidate.startY;
+    if (dx * dx + dy * dy > TAP_MAX_MOVE * TAP_MAX_MOVE) return;
+
+    pending = candidate.capture;
+    openedAt = Date.now();
+    console.debug(describeCapture(candidate.capture));
+    showAtPoint(x, y);
+  };
+
+  const onTouchCancel = () => {
+    tapCandidate = null;
+  };
+
+  const onMouseDown = (event: MouseEvent) => {
+    if (Date.now() - lastTouchTime < TOUCH_MOUSE_GUARD_MS) return;
+    if (event.button !== 0) return;
+    if (toolbar && event.target instanceof Node && toolbar.contains(event.target)) {
+      tapCandidate = null;
+      return;
+    }
+    const candidate = tryBuildTapCandidate(doc, win, event.clientX, event.clientY, event.target);
+    if (candidate) {
+      tapCandidate = candidate;
+      return;
+    }
+    tapCandidate = null;
+    if (isToolbarVisible() && !busy && Date.now() - openedAt > OPEN_GUARD_MS) {
+      hide();
+    }
+  };
+
+  const onMouseMove = (event: MouseEvent) => {
+    if (Date.now() - lastTouchTime < TOUCH_MOUSE_GUARD_MS) return;
+    if (!tapCandidate) return;
+    const dx = event.clientX - tapCandidate.startX;
+    const dy = event.clientY - tapCandidate.startY;
+    if (dx * dx + dy * dy > TAP_MAX_MOVE * TAP_MAX_MOVE) {
+      tapCandidate.moved = true;
+      tapCandidate = null;
+    }
+  };
+
+  const onMouseUp = (event: MouseEvent) => {
+    if (Date.now() - lastTouchTime < TOUCH_MOUSE_GUARD_MS) return;
+    const candidate = tapCandidate;
+    tapCandidate = null;
+    if (!candidate || candidate.moved) return;
+    if (!readPrefs().enabled || busy) return;
+    if (Date.now() - candidate.startTime > TAP_MAX_DURATION) return;
+
+    const dx = event.clientX - candidate.startX;
+    const dy = event.clientY - candidate.startY;
+    if (dx * dx + dy * dy > TAP_MAX_MOVE * TAP_MAX_MOVE) return;
+
+    pending = candidate.capture;
+    openedAt = Date.now();
+    console.debug(describeCapture(candidate.capture));
+    showAtPoint(event.clientX, event.clientY);
+  };
+
   const onKeyDown = (event: KeyboardEvent) => {
     if (event.key !== 'Escape') return;
-    // 忙的时候 Esc 等于「取消」：按钮此刻就是取消键，语义一致。
-    // 空闲时才只是把浮出按钮收起来。
     if (busy) {
       cancel();
       return;
@@ -411,27 +484,28 @@ export function bindSelectionTrigger(options: TriggerOptions = {}): () => void {
     hide();
   };
 
-  doc.addEventListener('mouseup', onSettle, true);
-  doc.addEventListener('touchend', onTouchEnd, true);
-  doc.addEventListener('keyup', onSettle, true);
-  doc.addEventListener('selectionchange', onSelectionChange, true);
+  doc.addEventListener('touchstart', onTouchStart, { capture: true, passive: true });
+  doc.addEventListener('touchmove', onTouchMove, { capture: true, passive: true });
+  doc.addEventListener('touchend', onTouchEnd, { capture: true, passive: true });
+  doc.addEventListener('touchcancel', onTouchCancel, { capture: true, passive: true });
+  doc.addEventListener('mousedown', onMouseDown, true);
+  doc.addEventListener('mousemove', onMouseMove, true);
+  doc.addEventListener('mouseup', onMouseUp, true);
   doc.addEventListener('keydown', onKeyDown, true);
-  win.addEventListener('scroll', onScroll, true);
 
-  diagnostic('trigger:bound', { toolbarId: TOOLBAR_ID, coarsePointer: COARSE_POINTER, settleDelay: SETTLE_DELAY });
+  diagnostic('trigger:bound', { toolbarId: TOOLBAR_ID, coarsePointer: COARSE_POINTER, mode: 'tap-selection' });
 
   return () => {
-    doc.removeEventListener('mouseup', onSettle, true);
+    unbindPrefs();
+    doc.removeEventListener('touchstart', onTouchStart, true);
+    doc.removeEventListener('touchmove', onTouchMove, true);
     doc.removeEventListener('touchend', onTouchEnd, true);
-    doc.removeEventListener('keyup', onSettle, true);
-    doc.removeEventListener('selectionchange', onSelectionChange, true);
+    doc.removeEventListener('touchcancel', onTouchCancel, true);
+    doc.removeEventListener('mousedown', onMouseDown, true);
+    doc.removeEventListener('mousemove', onMouseMove, true);
+    doc.removeEventListener('mouseup', onMouseUp, true);
     doc.removeEventListener('keydown', onKeyDown, true);
-    win.removeEventListener('scroll', onScroll, true);
-    if (settleTimer !== null) {
-      window.clearTimeout(settleTimer);
-      settleTimer = null;
-    }
-    dismissed = false;
+    tapCandidate = null;
     toolbar?.remove();
     toolbar = null;
     generateButton = null;
